@@ -2,6 +2,7 @@
 const cors = require("cors");
 const path = require("path");
 const fs = require("fs");
+const os = require("os");
 const crypto = require("crypto");
 const multer = require("multer");
 const { MongoClient, ObjectId, ServerApiVersion } = require("mongodb");
@@ -11,10 +12,16 @@ const app = express();
 const port = process.env.PORT || 5000;
 const clientUrl = process.env.CLIENT_URL || "http://localhost:3000";
 
-// Ensure uploads directory exists
-const uploadDir = path.join(__dirname, "uploads");
+// Ensure uploads directory exists (uses /tmp on Vercel serverless)
+const uploadDir = process.env.VERCEL
+  ? path.join(os.tmpdir(), "uploads")
+  : path.join(__dirname, "uploads");
 if (!fs.existsSync(uploadDir)) {
-  fs.mkdirSync(uploadDir, { recursive: true });
+  try {
+    fs.mkdirSync(uploadDir, { recursive: true });
+  } catch (err) {
+    console.error("Failed to create uploadDir:", err);
+  }
 }
 
 // Multer Storage Configuration
@@ -48,7 +55,7 @@ const upload = multer({
 // Middleware
 app.use(
   cors({
-    origin: [clientUrl, "http://localhost:3000", "http://127.0.0.1:3000"],
+    origin: true,
     credentials: true,
   })
 );
@@ -82,18 +89,30 @@ const client = new MongoClient(mongoUri, {
 
 let db;
 let papersCollection;
+let isConnected = false;
 
-async function initDB() {
-  try {
+async function ensureDb() {
+  if (!isConnected || !papersCollection) {
     await client.connect();
     db = client.db("intelli-submit");
     papersCollection = db.collection("papers");
+    isConnected = true;
     console.log("Connected to MongoDB Atlas: intelli-submit database");
-  } catch (error) {
-    console.error("Failed to connect to MongoDB:", error);
   }
 }
-initDB();
+ensureDb().catch((err) => console.error("Initial MongoDB connect error:", err));
+
+// Middleware to ensure DB connection is ready for serverless requests
+app.use(async (req, res, next) => {
+  if (req.path === "/") return next();
+  try {
+    await ensureDb();
+    next();
+  } catch (err) {
+    console.error("MongoDB connection error:", err);
+    res.status(500).json({ success: false, error: "Database connection failed" });
+  }
+});
 
 // Root route
 app.get("/", (req, res) => {
@@ -482,9 +501,13 @@ app.post("/api/papers/review/:token", async (req, res) => {
   }
 });
 
-// Start Express server
-app.listen(port, () => {
-  console.log(`IntelliSubmit server running on http://localhost:${port}`);
-  console.log(`Uploads available at http://localhost:${port}/uploads/`);
-});
+// Start Express server (when running locally)
+if (process.env.NODE_ENV !== "production" || !process.env.VERCEL) {
+  app.listen(port, () => {
+    console.log(`IntelliSubmit server running on http://localhost:${port}`);
+    console.log(`Uploads available at http://localhost:${port}/uploads/`);
+  });
+}
+
+module.exports = app;
 
