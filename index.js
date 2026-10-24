@@ -1,4 +1,4 @@
-﻿const express = require("express");
+const express = require("express");
 const cors = require("cors");
 const path = require("path");
 const fs = require("fs");
@@ -16,6 +16,7 @@ const clientUrl = process.env.CLIENT_URL || "http://localhost:3000";
 const uploadDir = process.env.VERCEL
   ? path.join(os.tmpdir(), "uploads")
   : path.join(__dirname, "uploads");
+
 if (!fs.existsSync(uploadDir)) {
   try {
     fs.mkdirSync(uploadDir, { recursive: true });
@@ -60,6 +61,8 @@ app.use(
   })
 );
 
+app.options("*", cors({ origin: true, credentials: true }));
+
 app.use(express.json());
 
 // Serve uploaded files statically with cross-origin headers for iframe embedding
@@ -89,13 +92,15 @@ const client = new MongoClient(mongoUri, {
 
 let db;
 let papersCollection;
+let usersCollection;
 let isConnected = false;
 
 async function ensureDb() {
-  if (!isConnected || !papersCollection) {
+  if (!isConnected || !papersCollection || !usersCollection) {
     await client.connect();
     db = client.db("intelli-submit");
     papersCollection = db.collection("papers");
+    usersCollection = db.collection("user");
     isConnected = true;
     console.log("Connected to MongoDB Atlas: intelli-submit database");
   }
@@ -120,18 +125,202 @@ app.get("/", (req, res) => {
 });
 
 // Helper: Format file response object
-const formatFileInfo = (req, file) => {
-  const protocol = req.protocol;
+const formatFileInfo = (req, file, paperId = null) => {
   const host = req.get("host");
+  const protocol = req.headers["x-forwarded-proto"] || req.protocol || "https";
+  const baseUrl = `${protocol}://${host}`;
   return {
     filename: file.filename,
     originalName: file.originalname,
     mimetype: file.mimetype,
     size: file.size,
     path: file.path,
-    url: `${protocol}://${host}/uploads/${file.filename}`,
+    url: paperId ? `${baseUrl}/api/papers/${paperId}/file` : `${baseUrl}/uploads/${file.filename}`,
+    downloadUrl: paperId ? `${baseUrl}/api/papers/${paperId}/download` : `${baseUrl}/uploads/${file.filename}`,
   };
 };
+
+const enrichPaperUrls = (req, paper) => {
+  if (!paper) return paper;
+  const host = req.get("host");
+  const protocol = req.headers["x-forwarded-proto"] || req.protocol || "https";
+  const baseUrl = `${protocol}://${host}`;
+  const paperId = paper._id ? paper._id.toString() : null;
+
+  if (paper.file && paperId) {
+    paper.file.url = `${baseUrl}/api/papers/${paperId}/file`;
+    paper.file.downloadUrl = `${baseUrl}/api/papers/${paperId}/download`;
+  }
+  return paper;
+};
+
+/* ========================================================
+   FILE SERVING & DOWNLOAD ROUTES (Persistent via MongoDB / Disk)
+   ======================================================== */
+
+// GET /api/papers/:id/download - Direct file download with attachment header
+app.get("/api/papers/:id/download", async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).json({ success: false, error: "Invalid paper ID format" });
+    }
+
+    const paper = await papersCollection.findOne({ _id: new ObjectId(id) });
+    if (!paper || !paper.file) {
+      return res.status(404).json({ success: false, error: "Paper or file not found" });
+    }
+
+    const filename = paper.file.originalName || paper.file.filename || "manuscript.pdf";
+    const mimetype = paper.file.mimetype || "application/octet-stream";
+
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Content-Disposition", `attachment; filename="${encodeURIComponent(filename)}"`);
+    res.setHeader("Content-Type", mimetype);
+
+    // 1. Stored in MongoDB (Buffer or base64 string)
+    if (paper.file.data) {
+      const buffer = Buffer.isBuffer(paper.file.data)
+        ? paper.file.data
+        : Buffer.from(paper.file.data, "base64");
+      return res.send(buffer);
+    }
+
+    // 2. Check local disk
+    const diskPath = paper.file.path || path.join(uploadDir, paper.file.filename || "");
+    if (diskPath && fs.existsSync(diskPath)) {
+      return res.download(diskPath, filename);
+    }
+
+    // 3. Fallback redirect
+    if (paper.file.url && !paper.file.url.includes("/api/papers/")) {
+      return res.redirect(paper.file.url);
+    }
+
+    res.status(404).json({ success: false, error: "File data not found on server" });
+  } catch (err) {
+    console.error("Error downloading paper file:", err);
+    res.status(500).json({ success: false, error: "Failed to download file" });
+  }
+});
+
+// GET /api/papers/:id/file - Stream file inline for in-browser previewer
+app.get("/api/papers/:id/file", async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).json({ success: false, error: "Invalid paper ID format" });
+    }
+
+    const paper = await papersCollection.findOne({ _id: new ObjectId(id) });
+    if (!paper || !paper.file) {
+      return res.status(404).json({ success: false, error: "Paper or file not found" });
+    }
+
+    const filename = paper.file.originalName || paper.file.filename || "manuscript.pdf";
+    const mimetype = paper.file.mimetype || "application/pdf";
+
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Cross-Origin-Resource-Policy", "cross-origin");
+    res.setHeader("Content-Disposition", `inline; filename="${encodeURIComponent(filename)}"`);
+    res.setHeader("Content-Type", mimetype);
+
+    if (paper.file.data) {
+      const buffer = Buffer.isBuffer(paper.file.data)
+        ? paper.file.data
+        : Buffer.from(paper.file.data, "base64");
+      return res.send(buffer);
+    }
+
+    const diskPath = paper.file.path || path.join(uploadDir, paper.file.filename || "");
+    if (diskPath && fs.existsSync(diskPath)) {
+      return res.sendFile(diskPath);
+    }
+
+    if (paper.file.url && !paper.file.url.includes("/api/papers/")) {
+      return res.redirect(paper.file.url);
+    }
+
+    res.status(404).json({ success: false, error: "File content not found" });
+  } catch (err) {
+    console.error("Error viewing paper file:", err);
+    res.status(500).json({ success: false, error: "Failed to display file" });
+  }
+});
+
+/* ========================================================
+   USER / ROLE MANAGEMENT ROUTES (Admin Portal)
+   ======================================================== */
+
+// GET /api/admin/users - Get all users
+app.get("/api/admin/users", async (req, res) => {
+  try {
+    const users = await usersCollection
+      .find({}, { projection: { password: 0 } })
+      .sort({ createdAt: -1 })
+      .toArray();
+
+    const sanitizedUsers = users.map((u) => ({
+      _id: u._id,
+      name: u.name || "User",
+      email: u.email,
+      role: u.role || "author",
+      image: u.image || null,
+      createdAt: u.createdAt || null,
+    }));
+
+    res.json({
+      success: true,
+      count: sanitizedUsers.length,
+      users: sanitizedUsers,
+    });
+  } catch (err) {
+    console.error("Error fetching users:", err);
+    res.status(500).json({ success: false, error: "Failed to fetch users" });
+  }
+});
+
+// PATCH /api/admin/users/:id/role - Update a user's role
+app.patch("/api/admin/users/:id/role", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { role } = req.body;
+
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).json({ success: false, error: "Invalid user ID format" });
+    }
+
+    if (!["author", "reviewer", "admin"].includes(role)) {
+      return res.status(400).json({
+        success: false,
+        error: "Role must be 'author', 'reviewer', or 'admin'",
+      });
+    }
+
+    const result = await usersCollection.updateOne(
+      { _id: new ObjectId(id) },
+      { $set: { role, updatedAt: new Date() } }
+    );
+
+    if (result.matchedCount === 0) {
+      return res.status(404).json({ success: false, error: "User not found" });
+    }
+
+    const updatedUser = await usersCollection.findOne(
+      { _id: new ObjectId(id) },
+      { projection: { password: 0 } }
+    );
+
+    res.json({
+      success: true,
+      message: `User role updated to ${role}`,
+      user: updatedUser,
+    });
+  } catch (err) {
+    console.error("Error updating user role:", err);
+    res.status(500).json({ success: false, error: "Failed to update user role" });
+  }
+});
 
 /* ========================================================
    AUTHOR ROUTES: Submit Paper & Manage Author Papers
@@ -176,6 +365,21 @@ app.post("/api/papers", upload.single("file"), async (req, res) => {
       parsedKeywords = keywords;
     }
 
+    // Read file buffer for persistent storage in MongoDB
+    let fileBase64 = null;
+    if (req.file.path && fs.existsSync(req.file.path)) {
+      try {
+        fileBase64 = fs.readFileSync(req.file.path).toString("base64");
+      } catch (e) {
+        console.error("Failed to read file into base64:", e);
+      }
+    }
+
+    const fileMeta = formatFileInfo(req, req.file);
+    if (fileBase64) {
+      fileMeta.data = fileBase64;
+    }
+
     const newPaper = {
       title: title.trim(),
       abstract: abstract.trim(),
@@ -184,7 +388,7 @@ app.post("/api/papers", upload.single("file"), async (req, res) => {
       keywords: parsedKeywords,
       authorEmail: authorEmail || "author@example.com",
       authorName: authorName || "Author",
-      file: formatFileInfo(req, req.file),
+      file: fileMeta,
       status: "Submitted", // Submitted, Under Review, Revision Requested, Resubmitted, Published
       reviewToken: null,
       reviewTokenCreatedAt: null,
@@ -196,6 +400,10 @@ app.post("/api/papers", upload.single("file"), async (req, res) => {
 
     const result = await papersCollection.insertOne(newPaper);
     newPaper._id = result.insertedId;
+
+    // Attach direct file preview & download URLs
+    enrichPaperUrls(req, newPaper);
+    delete newPaper.file.data;
 
     res.status(201).json({
       success: true,
@@ -217,11 +425,13 @@ app.get("/api/papers/author", async (req, res) => {
     }
 
     const papers = await papersCollection
-      .find({ authorEmail: email })
+      .find({ authorEmail: email }, { projection: { "file.data": 0, "previousFiles.data": 0 } })
       .sort({ updatedAt: -1 })
       .toArray();
 
-    res.json({ success: true, count: papers.length, papers });
+    const enrichedPapers = papers.map((p) => enrichPaperUrls(req, p));
+
+    res.json({ success: true, count: enrichedPapers.length, papers: enrichedPapers });
   } catch (err) {
     console.error("Error fetching author papers:", err);
     res.status(500).json({ success: false, error: "Failed to fetch papers" });
@@ -246,13 +456,25 @@ app.post("/api/papers/:id/resubmit", upload.single("file"), async (req, res) => 
     };
 
     if (req.file) {
-      const newFile = formatFileInfo(req, req.file);
+      let fileBase64 = null;
+      if (req.file.path && fs.existsSync(req.file.path)) {
+        try {
+          fileBase64 = fs.readFileSync(req.file.path).toString("base64");
+        } catch (e) {
+          console.error("Failed to read resubmit file into base64:", e);
+        }
+      }
+
+      const newFile = formatFileInfo(req, req.file, id);
+      if (fileBase64) {
+        newFile.data = fileBase64;
+      }
+
       const previousFiles = paper.previousFiles || [];
       if (paper.file) {
-        previousFiles.push({
-          ...paper.file,
-          replacedAt: new Date(),
-        });
+        const archivedFile = { ...paper.file, replacedAt: new Date() };
+        delete archivedFile.data;
+        previousFiles.push(archivedFile);
       }
       updateFields.file = newFile;
       updateFields.previousFiles = previousFiles;
@@ -263,7 +485,12 @@ app.post("/api/papers/:id/resubmit", upload.single("file"), async (req, res) => 
       { $set: updateFields }
     );
 
-    const updatedPaper = await papersCollection.findOne({ _id: new ObjectId(id) });
+    const updatedPaper = await papersCollection.findOne(
+      { _id: new ObjectId(id) },
+      { projection: { "file.data": 0, "previousFiles.data": 0 } }
+    );
+
+    enrichPaperUrls(req, updatedPaper);
 
     res.json({
       success: true,
@@ -299,7 +526,12 @@ app.get("/api/papers", async (req, res) => {
       ];
     }
 
-    const papers = await papersCollection.find(query).sort({ updatedAt: -1 }).toArray();
+    const papers = await papersCollection
+      .find(query, { projection: { "file.data": 0, "previousFiles.data": 0 } })
+      .sort({ updatedAt: -1 })
+      .toArray();
+
+    const enrichedPapers = papers.map((p) => enrichPaperUrls(req, p));
 
     // Summary counts for dashboard badges
     const totalCount = await papersCollection.countDocuments();
@@ -319,8 +551,8 @@ app.get("/api/papers", async (req, res) => {
         resubmitted: resubmittedCount,
         published: publishedCount,
       },
-      count: papers.length,
-      papers,
+      count: enrichedPapers.length,
+      papers: enrichedPapers,
     });
   } catch (err) {
     console.error("Error fetching all papers:", err);
@@ -336,10 +568,15 @@ app.get("/api/papers/:id", async (req, res) => {
       return res.status(400).json({ success: false, error: "Invalid paper ID format" });
     }
 
-    const paper = await papersCollection.findOne({ _id: new ObjectId(id) });
+    const paper = await papersCollection.findOne(
+      { _id: new ObjectId(id) },
+      { projection: { "file.data": 0, "previousFiles.data": 0 } }
+    );
     if (!paper) {
       return res.status(404).json({ success: false, error: "Paper not found" });
     }
+
+    enrichPaperUrls(req, paper);
 
     res.json({ success: true, paper });
   } catch (err) {
@@ -381,7 +618,11 @@ app.post("/api/papers/:id/generate-token", async (req, res) => {
       { $set: updateDoc }
     );
 
-    const updatedPaper = await papersCollection.findOne({ _id: new ObjectId(id) });
+    const updatedPaper = await papersCollection.findOne(
+      { _id: new ObjectId(id) },
+      { projection: { "file.data": 0, "previousFiles.data": 0 } }
+    );
+    enrichPaperUrls(req, updatedPaper);
 
     res.json({
       success: true,
@@ -408,10 +649,18 @@ app.get("/api/papers/review/:token", async (req, res) => {
       return res.status(400).json({ success: false, error: "Review token is required" });
     }
 
-    const paper = await papersCollection.findOne({ reviewToken: token });
+    const paper = await papersCollection.findOne(
+      { reviewToken: token },
+      { projection: { "file.data": 0, "previousFiles.data": 0 } }
+    );
     if (!paper) {
-      return res.status(404).json({ success: false, error: "Invalid or expired review link. Please contact the administrator." });
+      return res.status(404).json({
+        success: false,
+        error: "Invalid or expired review link. Please contact the administrator.",
+      });
     }
+
+    enrichPaperUrls(req, paper);
 
     res.json({ success: true, paper });
   } catch (err) {
@@ -485,7 +734,11 @@ app.post("/api/papers/review/:token", async (req, res) => {
       }
     );
 
-    const updatedPaper = await papersCollection.findOne({ _id: paper._id });
+    const updatedPaper = await papersCollection.findOne(
+      { _id: paper._id },
+      { projection: { "file.data": 0, "previousFiles.data": 0 } }
+    );
+    enrichPaperUrls(req, updatedPaper);
 
     res.json({
       success: true,
@@ -510,4 +763,3 @@ if (process.env.NODE_ENV !== "production" || !process.env.VERCEL) {
 }
 
 module.exports = app;
-
